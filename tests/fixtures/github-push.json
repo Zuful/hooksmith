@@ -1,0 +1,32 @@
+{
+  "ref": "refs/heads/main",
+  "before": "abc123def456",
+  "after": "def456abc789",
+  "repository": {
+    "id": 123456,
+    "name": "hooksmith",
+    "full_name": "acme/hooksmith",
+    "html_url": "https://github.com/acme/hooksmith",
+    "default_branch": "main"
+  },
+  "pusher": {
+    "name": "octocat",
+    "email": "octocat@github.com"
+  },
+  "sender": {
+    "login": "octocat",
+    "id": 1,
+    "type": "User"
+  },
+  "commits": [
+    {
+      "id": "def456abc789",
+      "message": "Update README",
+      "timestamp": "2026-03-25T12:00:00Z",
+      "author": {
+        "name": "Octocat",
+        "email": "octocat@github.com"
+      }
+    }
+  ]
+}
