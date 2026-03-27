@@ -1,32 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { join } from "node:path";
-import { homedir } from "node:os";
-import type { WebhookEvent } from "../types";
-
-const inboxDir =
-  process.env.HOOKSMITH_INBOX_DIR || join(homedir(), ".hooksmith", "inbox");
-const processedDir = join(inboxDir, "processed");
-
-async function readEvent(filePath: string): Promise<WebhookEvent | null> {
-  try {
-    const file = Bun.file(filePath);
-    return (await file.json()) as WebhookEvent;
-  } catch {
-    return null;
-  }
-}
-
-async function readAllEvents(dir: string): Promise<WebhookEvent[]> {
-  const glob = new Bun.Glob("*.json");
-  const events: WebhookEvent[] = [];
-  for await (const path of glob.scan({ cwd: dir, absolute: false })) {
-    const event = await readEvent(join(dir, path));
-    if (event) events.push(event);
-  }
-  return events;
-}
+import { queryEvents, findEvent, ackEvent, deleteProcessed, listSources } from "../db";
 
 export function createMcpServer(): McpServer {
   const server = new McpServer({
@@ -34,40 +9,30 @@ export function createMcpServer(): McpServer {
     version: "1.0.0",
   });
 
-  // get_events — list recent webhook events
+  // get_events — list recent webhook events from the inbox
   server.tool(
     "get_events",
-    "List recent webhook events from the inbox, optionally filtered by source and type",
+    "List recent webhook events, optionally filtered by source and type",
     {
       source: z.string().optional(),
       type: z.string().optional(),
       limit: z.number().default(20),
     },
     async ({ source, type, limit }) => {
-      let events = await readAllEvents(inboxDir);
-
-      if (source) events = events.filter((e) => e.source === source);
-      if (type) events = events.filter((e) => e.type === type);
-
-      events.sort(
-        (a, b) =>
-          new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-      );
-      events = events.slice(0, limit);
-
+      const events = queryEvents({ source, type, limit });
       return {
         content: [{ type: "text", text: JSON.stringify(events, null, 2) }],
       };
-    }
+    },
   );
 
-  // get_event — get a single event by ID
+  // get_event — fetch a single event by ID
   server.tool(
     "get_event",
     "Get a single webhook event by its ID",
     { id: z.string() },
     async ({ id }) => {
-      const event = await readEvent(join(inboxDir, `${id}.json`));
+      const event = findEvent(id);
       if (!event) {
         return {
           content: [{ type: "text", text: `Event not found: ${id}` }],
@@ -77,75 +42,51 @@ export function createMcpServer(): McpServer {
       return {
         content: [{ type: "text", text: JSON.stringify(event, null, 2) }],
       };
-    }
+    },
   );
 
-  // ack_event — acknowledge/process an event
+  // ack_event — mark an event as processed
   server.tool(
     "ack_event",
-    "Acknowledge an event by moving it from inbox to processed",
+    "Acknowledge an event (marks it as processed so it no longer appears in get_events)",
     { id: z.string() },
     async ({ id }) => {
-      const src = join(inboxDir, `${id}.json`);
-      const dest = join(processedDir, `${id}.json`);
-
-      try {
-        await Bun.write(dest, Bun.file(src));
-        const { unlink } = await import("node:fs/promises");
-        await unlink(src);
-      } catch {
+      const ok = ackEvent(id);
+      if (!ok) {
         return {
-          content: [
-            { type: "text", text: `Failed to acknowledge event: ${id}` },
-          ],
+          content: [{ type: "text", text: `Event not found or already processed: ${id}` }],
           isError: true,
         };
       }
-
       return {
         content: [{ type: "text", text: JSON.stringify({ ok: true }) }],
       };
-    }
+    },
   );
 
-  // list_sources — list unique sources
+  // list_sources — distinct sources that have sent events
   server.tool(
     "list_sources",
-    "List all webhook sources that have sent events",
+    "List all webhook sources that have sent at least one event",
     async () => {
-      const events = await readAllEvents(inboxDir);
-      const sources = [...new Set(events.map((e) => e.source))].sort();
+      const sources = listSources();
       return {
         content: [{ type: "text", text: JSON.stringify(sources, null, 2) }],
       };
-    }
+    },
   );
 
-  // clear_events — remove acknowledged events
+  // clear_events — permanently delete processed events
   server.tool(
     "clear_events",
-    "Remove acknowledged (processed) events, optionally filtered by source",
+    "Permanently delete processed events, optionally filtered by source",
     { source: z.string().optional() },
     async ({ source }) => {
-      const { unlink } = await import("node:fs/promises");
-      let events = await readAllEvents(processedDir);
-
-      if (source) events = events.filter((e) => e.source === source);
-
-      let deleted = 0;
-      for (const event of events) {
-        try {
-          await unlink(join(processedDir, `${event.id}.json`));
-          deleted++;
-        } catch {
-          // skip files that can't be deleted
-        }
-      }
-
+      const deleted = deleteProcessed(source);
       return {
         content: [{ type: "text", text: JSON.stringify({ deleted }) }],
       };
-    }
+    },
   );
 
   return server;

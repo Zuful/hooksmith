@@ -1,17 +1,19 @@
 import { test, expect, describe, beforeAll, afterAll } from "bun:test";
-import { mkdtemp, rm, writeFile, mkdir } from "node:fs/promises";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import type { WebhookEvent } from "../src/types";
+import {
+  insertEvent,
+  findEvent,
+  queryEvents,
+  ackEvent,
+  deleteProcessed,
+  listSources,
+  resetDb,
+} from "../src/db";
 
-/**
- * MCP server tests — we test the underlying functions by importing the module
- * after setting up the HOOKSMITH_INBOX_DIR env var. Since the MCP server reads
- * from the inbox directory, we create test event files directly.
- */
-
-let inboxDir: string;
-let processedDir: string;
+let testDbPath: string;
 
 function makeEvent(overrides: Partial<WebhookEvent> = {}): WebhookEvent {
   return {
@@ -25,136 +27,117 @@ function makeEvent(overrides: Partial<WebhookEvent> = {}): WebhookEvent {
   };
 }
 
-beforeAll(async () => {
-  inboxDir = await mkdtemp(join(tmpdir(), "hooksmith-mcp-test-"));
-  processedDir = join(inboxDir, "processed");
-  await mkdir(processedDir, { recursive: true });
-  process.env.HOOKSMITH_INBOX_DIR = inboxDir;
+beforeAll(() => {
+  testDbPath = join(tmpdir(), `hooksmith-mcp-test-${Date.now()}.db`);
+  process.env.HOOKSMITH_DB_PATH = testDbPath;
 });
 
 afterAll(async () => {
-  await rm(inboxDir, { recursive: true, force: true });
-  delete process.env.HOOKSMITH_INBOX_DIR;
+  resetDb();
+  await rm(testDbPath, { force: true });
+  delete process.env.HOOKSMITH_DB_PATH;
 });
 
-async function writeEvent(event: WebhookEvent, dir?: string): Promise<void> {
-  await writeFile(join(dir ?? inboxDir, `${event.id}.json`), JSON.stringify(event, null, 2));
-}
-
 describe("MCP server tools", () => {
-  // Since the MCP server module captures inboxDir at import time,
-  // we need to test via the HTTP-level or by directly testing the logic.
-  // We'll test the core read/write logic that the MCP tools depend on.
-
-  test("event files can be read back correctly", async () => {
+  test("inserted event can be retrieved by ID", () => {
     const event = makeEvent({ source: "github", type: "push" });
-    await writeEvent(event);
+    insertEvent(event);
 
-    const file = Bun.file(join(inboxDir, `${event.id}.json`));
-    const read = await file.json() as WebhookEvent;
-
-    expect(read.id).toBe(event.id);
-    expect(read.source).toBe("github");
-    expect(read.type).toBe("push");
+    const read = findEvent(event.id);
+    expect(read).toBeTruthy();
+    expect(read!.id).toBe(event.id);
+    expect(read!.source).toBe("github");
+    expect(read!.type).toBe("push");
   });
 
-  test("multiple events can be listed via glob", async () => {
-    const e1 = makeEvent({ source: "github", type: "push" });
-    const e2 = makeEvent({ source: "gitlab", type: "merge_request" });
-    const e3 = makeEvent({ source: "stripe", type: "webhook" });
-    await Promise.all([writeEvent(e1), writeEvent(e2), writeEvent(e3)]);
-
-    const glob = new Bun.Glob("*.json");
-    const files: string[] = [];
-    for await (const path of glob.scan({ cwd: inboxDir, absolute: false })) {
-      files.push(path);
-    }
-
-    // At least the 3 we just created (plus any from prior tests)
-    expect(files.length).toBeGreaterThanOrEqual(3);
+  test("findEvent returns null for unknown ID", () => {
+    expect(findEvent("does-not-exist")).toBeNull();
   });
 
-  test("events can be filtered by source", async () => {
-    const e1 = makeEvent({ source: "github", type: "push" });
-    const e2 = makeEvent({ source: "gitlab", type: "merge_request" });
-    await Promise.all([writeEvent(e1), writeEvent(e2)]);
+  test("queryEvents returns pending events, newest first", () => {
+    const e1 = makeEvent({ timestamp: "2026-03-25T01:00:00Z" });
+    const e2 = makeEvent({ timestamp: "2026-03-25T03:00:00Z" });
+    const e3 = makeEvent({ timestamp: "2026-03-25T02:00:00Z" });
+    insertEvent(e1);
+    insertEvent(e2);
+    insertEvent(e3);
 
-    const glob = new Bun.Glob("*.json");
-    const events: WebhookEvent[] = [];
-    for await (const path of glob.scan({ cwd: inboxDir, absolute: false })) {
-      const data = await Bun.file(join(inboxDir, path)).json() as WebhookEvent;
-      events.push(data);
+    const events = queryEvents({ limit: 100 });
+    for (let i = 0; i < events.length - 1; i++) {
+      expect(new Date(events[i]!.timestamp).getTime()).toBeGreaterThanOrEqual(
+        new Date(events[i + 1]!.timestamp).getTime(),
+      );
     }
+  });
 
-    const githubEvents = events.filter((e) => e.source === "github");
-    const gitlabEvents = events.filter((e) => e.source === "gitlab");
+  test("queryEvents filters by source", () => {
+    const gh = makeEvent({ source: "github" });
+    const gl = makeEvent({ source: "gitlab" });
+    insertEvent(gh);
+    insertEvent(gl);
 
+    const githubEvents = queryEvents({ source: "github", limit: 100 });
+    const gitlabEvents = queryEvents({ source: "gitlab", limit: 100 });
+
+    expect(githubEvents.every((e) => e.source === "github")).toBe(true);
+    expect(gitlabEvents.every((e) => e.source === "gitlab")).toBe(true);
     expect(githubEvents.length).toBeGreaterThanOrEqual(1);
     expect(gitlabEvents.length).toBeGreaterThanOrEqual(1);
   });
 
-  test("ack moves event from inbox to processed", async () => {
-    const event = makeEvent({ source: "github", type: "push" });
-    await writeEvent(event);
+  test("queryEvents filters by type", () => {
+    const push = makeEvent({ type: "push" });
+    const pr = makeEvent({ type: "pull_request" });
+    insertEvent(push);
+    insertEvent(pr);
 
-    // Simulate ack: copy to processed, delete from inbox
-    const src = join(inboxDir, `${event.id}.json`);
-    const dest = join(processedDir, `${event.id}.json`);
-    await Bun.write(dest, Bun.file(src));
-    const { unlink } = await import("node:fs/promises");
-    await unlink(src);
-
-    // Verify moved
-    const inboxFile = Bun.file(src);
-    expect(await inboxFile.exists()).toBe(false);
-
-    const processedFile = Bun.file(dest);
-    expect(await processedFile.exists()).toBe(true);
-
-    const read = await processedFile.json() as WebhookEvent;
-    expect(read.id).toBe(event.id);
+    const pushEvents = queryEvents({ type: "push", limit: 100 });
+    expect(pushEvents.every((e) => e.type === "push")).toBe(true);
   });
 
-  test("list_sources returns unique sources", async () => {
-    const e1 = makeEvent({ source: "github" });
-    const e2 = makeEvent({ source: "gitlab" });
-    const e3 = makeEvent({ source: "github" }); // duplicate
-    await Promise.all([writeEvent(e1), writeEvent(e2), writeEvent(e3)]);
+  test("ackEvent marks event as processed, hides it from default queryEvents", () => {
+    const event = makeEvent();
+    insertEvent(event);
 
-    const glob = new Bun.Glob("*.json");
-    const events: WebhookEvent[] = [];
-    for await (const path of glob.scan({ cwd: inboxDir, absolute: false })) {
-      const data = await Bun.file(join(inboxDir, path)).json() as WebhookEvent;
-      events.push(data);
-    }
+    expect(ackEvent(event.id)).toBe(true);
 
-    const sources = [...new Set(events.map((e) => e.source))].sort();
-    expect(sources).toContain("github");
-    expect(sources).toContain("gitlab");
+    // Pending inbox should no longer contain this event
+    const pending = queryEvents({ limit: 100 });
+    expect(pending.find((e) => e.id === event.id)).toBeUndefined();
+
+    // Should appear in processed view
+    const processed = queryEvents({ status: "processed", limit: 100 });
+    expect(processed.find((e) => e.id === event.id)).toBeTruthy();
   });
 
-  test("events sort by timestamp descending", async () => {
-    const e1 = makeEvent({ timestamp: "2026-03-25T01:00:00Z" });
-    const e2 = makeEvent({ timestamp: "2026-03-25T03:00:00Z" });
-    const e3 = makeEvent({ timestamp: "2026-03-25T02:00:00Z" });
-    await Promise.all([writeEvent(e1), writeEvent(e2), writeEvent(e3)]);
+  test("ackEvent returns false for unknown or already-processed event", () => {
+    expect(ackEvent("no-such-id")).toBe(false);
+  });
 
-    const glob = new Bun.Glob("*.json");
-    const events: WebhookEvent[] = [];
-    for await (const path of glob.scan({ cwd: inboxDir, absolute: false })) {
-      const data = await Bun.file(join(inboxDir, path)).json() as WebhookEvent;
-      events.push(data);
-    }
+  test("listSources returns unique sources", () => {
+    insertEvent(makeEvent({ source: "stripe" }));
+    insertEvent(makeEvent({ source: "stripe" })); // duplicate
+    insertEvent(makeEvent({ source: "custom" }));
 
-    events.sort(
-      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
-    );
+    const sources = listSources();
+    expect(sources).toContain("stripe");
+    expect(sources).toContain("custom");
+    // No duplicates
+    expect(sources.length).toBe(new Set(sources).size);
+  });
 
-    // Verify sorting: first event should have the latest timestamp
-    for (let i = 0; i < events.length - 1; i++) {
-      expect(new Date(events[i]!.timestamp).getTime()).toBeGreaterThanOrEqual(
-        new Date(events[i + 1]!.timestamp).getTime()
-      );
-    }
+  test("deleteProcessed removes processed events", () => {
+    const e1 = makeEvent({ source: "cleanup-test" });
+    const e2 = makeEvent({ source: "cleanup-test" });
+    insertEvent(e1);
+    insertEvent(e2);
+    ackEvent(e1.id);
+    ackEvent(e2.id);
+
+    const deleted = deleteProcessed("cleanup-test");
+    expect(deleted).toBe(2);
+
+    const remaining = queryEvents({ source: "cleanup-test", status: "processed", limit: 100 });
+    expect(remaining.length).toBe(0);
   });
 });

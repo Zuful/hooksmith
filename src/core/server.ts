@@ -1,15 +1,8 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { mkdir } from "node:fs/promises";
-import { join } from "node:path";
-import { homedir } from "node:os";
 import type { WebhookEvent } from "../types.js";
+import { insertEvent } from "../db.js";
 
 const DEFAULT_PORT = 3420;
-const DEFAULT_INBOX_DIR = join(homedir(), ".hooksmith", "inbox");
-
-function getInboxDir(): string {
-  return process.env.HOOKSMITH_INBOX_DIR || DEFAULT_INBOX_DIR;
-}
 
 function verifyGitHubSignature(
   payload: string,
@@ -98,11 +91,8 @@ function inferEventType(
   return (payload.type as string) || "unknown";
 }
 
-async function saveEvent(event: WebhookEvent): Promise<void> {
-  const inboxDir = getInboxDir();
-  await mkdir(inboxDir, { recursive: true });
-  const filePath = join(inboxDir, `${event.id}.json`);
-  await Bun.write(filePath, JSON.stringify(event, null, 2));
+function saveEvent(event: WebhookEvent): void {
+  insertEvent(event);
 }
 
 async function handleWebhook(req: Request, source: string): Promise<Response> {
@@ -130,7 +120,7 @@ async function handleWebhook(req: Request, source: string): Promise<Response> {
   // Normalize and save
   try {
     const event = await normalizeEvent(source, payload, req.headers);
-    await saveEvent(event);
+    saveEvent(event);
     return Response.json({ ok: true, id: event.id });
   } catch (err) {
     console.error("Error processing webhook:", err);

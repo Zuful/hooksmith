@@ -1,24 +1,26 @@
 import { test, expect, describe, afterAll, beforeAll } from "bun:test";
 import { startServer } from "../src/core/server";
-import { mkdtemp, readdir, readFile, rm } from "node:fs/promises";
+import { resetDb } from "../src/db";
+import { rm } from "node:fs/promises";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import githubPush from "./fixtures/github-push.json";
 import gitlabMR from "./fixtures/gitlab-mr.json";
 
 let server: ReturnType<typeof startServer>;
-let inboxDir: string;
+let testDbPath: string;
 
-beforeAll(async () => {
-  inboxDir = await mkdtemp(join(tmpdir(), "hooksmith-test-"));
-  process.env.HOOKSMITH_INBOX_DIR = inboxDir;
+beforeAll(() => {
+  testDbPath = join(tmpdir(), `hooksmith-test-${Date.now()}.db`);
+  process.env.HOOKSMITH_DB_PATH = testDbPath;
   server = startServer(0); // port 0 = random available port
 });
 
 afterAll(async () => {
   server.stop();
-  await rm(inboxDir, { recursive: true, force: true });
-  delete process.env.HOOKSMITH_INBOX_DIR;
+  resetDb();
+  await rm(testDbPath, { force: true });
+  delete process.env.HOOKSMITH_DB_PATH;
 });
 
 function url(path: string): string {
@@ -54,15 +56,13 @@ describe("Webhook server", () => {
     expect(body.ok).toBe(true);
     expect(body.id).toBeTruthy();
 
-    // Verify event file was created in inbox
-    const files = await readdir(inboxDir);
-    const eventFile = files.find((f) => f.endsWith(".json"));
-    expect(eventFile).toBeTruthy();
-
-    const eventData = JSON.parse(await readFile(join(inboxDir, eventFile!), "utf-8"));
-    expect(eventData.source).toBe("github");
-    expect(eventData.type).toBe("push");
-    expect(eventData.raw).toBeDefined();
+    // Verify the event was stored in the DB
+    const { findEvent } = await import("../src/db");
+    const event = findEvent(body.id);
+    expect(event).toBeTruthy();
+    expect(event!.source).toBe("github");
+    expect(event!.type).toBe("push");
+    expect(event!.raw).toBeDefined();
   });
 
   test("POST /webhook/gitlab stores a GitLab MR event", async () => {
@@ -114,10 +114,9 @@ describe("Webhook server", () => {
     expect(res.status).toBe(404);
   });
 
-  test("multiple events accumulate in inbox", async () => {
-    // Clear inbox for counting
-    const existingFiles = await readdir(inboxDir);
-    const initialCount = existingFiles.filter((f) => f.endsWith(".json")).length;
+  test("multiple events accumulate in the DB", async () => {
+    const { queryEvents } = await import("../src/db");
+    const before = queryEvents({ source: "github", limit: 100 }).length;
 
     await fetch(url("/webhook/github"), {
       method: "POST",
@@ -139,8 +138,7 @@ describe("Webhook server", () => {
       body: JSON.stringify({}),
     });
 
-    const files = await readdir(inboxDir);
-    const newCount = files.filter((f) => f.endsWith(".json")).length;
-    expect(newCount).toBe(initialCount + 2);
+    const after = queryEvents({ source: "github", limit: 100 }).length;
+    expect(after).toBe(before + 2);
   });
 });
