@@ -152,6 +152,16 @@ export function listSources(): string[] {
   return rows.map((r) => r.source);
 }
 
+export function deleteExpired(maxAgeDays: number): number {
+  const cutoff = new Date();
+  cutoff.setDate(cutoff.getDate() - maxAgeDays);
+  const result = getDb().run(
+    "DELETE FROM events WHERE timestamp < ?",
+    [cutoff.toISOString()]
+  );
+  return result.changes;
+}
+
 /** Close and reset the singleton — for use in tests only. */
 export function resetDb(): void {
   if (_db) {
