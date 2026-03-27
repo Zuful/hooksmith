@@ -1,8 +1,10 @@
 import { createHmac, randomUUID } from "node:crypto";
 import type { WebhookEvent } from "../types.js";
-import { insertEvent } from "../db.js";
+import { insertEvent, deleteExpired } from "../db.js";
+import { loadRules, shouldAccept } from "../rules.js";
 
 const DEFAULT_PORT = 3420;
+const rules = loadRules();
 
 function verifyGitHubSignature(
   payload: string,
@@ -117,9 +119,12 @@ async function handleWebhook(req: Request, source: string): Promise<Response> {
     return Response.json({ ok: false, error: "Invalid JSON" }, { status: 400 });
   }
 
-  // Normalize and save
+  // Normalize, filter, and save
   try {
     const event = await normalizeEvent(source, payload, req.headers);
+    if (!shouldAccept(rules, event.source, event.type)) {
+      return Response.json({ ok: false, error: "Event rejected by rules" }, { status: 200 });
+    }
     saveEvent(event);
     return Response.json({ ok: true, id: event.id });
   } catch (err) {
@@ -151,6 +156,15 @@ export function startServer(port?: number): ReturnType<typeof Bun.serve> {
   });
 
   console.log(`Hooksmith server listening on port ${server.port}`);
+
+  // TTL: delete expired events at startup and every hour
+  const getTtlDays = () => parseInt(process.env.HOOKSMITH_EVENT_TTL_DAYS ?? "30", 10);
+  deleteExpired(getTtlDays());
+  setInterval(() => {
+    const n = deleteExpired(getTtlDays());
+    if (n > 0) console.log(`TTL: deleted ${n} expired event(s)`);
+  }, 3_600_000);
+
   return server;
 }
 
