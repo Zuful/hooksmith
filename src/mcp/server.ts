@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { queryEvents, findEvent, ackEvent, deleteProcessed, listSources } from "../db";
+import { queryEvents, findEvent, ackEvent, deleteProcessed, listSources, insertEvent } from "../db";
 
 export function createMcpServer(): McpServer {
   const server = new McpServer({
@@ -85,6 +85,34 @@ export function createMcpServer(): McpServer {
       const deleted = deleteProcessed(source);
       return {
         content: [{ type: "text", text: JSON.stringify({ deleted }) }],
+      };
+    },
+  );
+
+  // replay_event — re-queue any event as a new pending event
+  server.tool(
+    "replay_event",
+    "Re-queue any event (pending or processed) as a brand-new pending event with a fresh ID",
+    { id: z.string() },
+    async ({ id }) => {
+      const event = findEvent(id);
+      if (!event) {
+        return {
+          content: [{ type: "text", text: `Event not found: ${id}` }],
+          isError: true,
+        };
+      }
+      const newEvent = {
+        id: crypto.randomUUID(),
+        source: event.source,
+        type: event.type,
+        timestamp: new Date().toISOString(),
+        payload: event.payload,
+        raw: event.raw,
+      };
+      insertEvent(newEvent);
+      return {
+        content: [{ type: "text", text: JSON.stringify({ ok: true, original_id: id, new_id: newEvent.id }) }],
       };
     },
   );

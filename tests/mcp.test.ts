@@ -126,6 +126,37 @@ describe("MCP server tools", () => {
     expect(sources.length).toBe(new Set(sources).size);
   });
 
+  test("replayed event appears as new pending event", () => {
+    const event = makeEvent({ source: "replay-test", type: "push" });
+    insertEvent(event);
+    ackEvent(event.id);
+
+    // Original should be processed
+    const processedBefore = queryEvents({ status: "processed", limit: 100 });
+    expect(processedBefore.find((e) => e.id === event.id)).toBeTruthy();
+
+    // Replay it
+    const original = findEvent(event.id)!;
+    const newId = crypto.randomUUID();
+    const replayed = {
+      id: newId,
+      source: original.source,
+      type: original.type,
+      timestamp: new Date().toISOString(),
+      payload: original.payload,
+      raw: original.raw,
+    };
+    insertEvent(replayed);
+
+    // New event should be pending
+    const pending = queryEvents({ status: "pending", limit: 100 });
+    expect(pending.find((e) => e.id === newId)).toBeTruthy();
+
+    // Original should still be processed
+    const processedAfter = queryEvents({ status: "processed", limit: 100 });
+    expect(processedAfter.find((e) => e.id === event.id)).toBeTruthy();
+  });
+
   test("deleteProcessed removes processed events", () => {
     const e1 = makeEvent({ source: "cleanup-test" });
     const e2 = makeEvent({ source: "cleanup-test" });
