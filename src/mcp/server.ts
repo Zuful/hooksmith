@@ -1,5 +1,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { WebStandardStreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/webStandardStreamableHttp.js";
 import { z } from "zod";
 import { queryEvents, findEvent, ackEvent, deleteProcessed, listSources, insertEvent } from "../db";
 
@@ -120,8 +121,62 @@ export function createMcpServer(): McpServer {
   return server;
 }
 
+async function startHttpMcpServer(server: McpServer): Promise<void> {
+  const port = parseInt(process.env.HOOKSMITH_MCP_PORT || "3421", 10);
+
+  // Map of session ID -> transport for stateful sessions
+  const sessions = new Map<string, WebStandardStreamableHTTPServerTransport>();
+
+  const httpServer = Bun.serve({
+    port,
+    async fetch(req: Request): Promise<Response> {
+      const url = new URL(req.url);
+      if (url.pathname !== "/mcp") {
+        return new Response("Not Found", { status: 404 });
+      }
+
+      // For initialization requests (no session ID), create a new transport
+      const sessionId = req.headers.get("mcp-session-id");
+      let transport: WebStandardStreamableHTTPServerTransport;
+
+      if (sessionId && sessions.has(sessionId)) {
+        transport = sessions.get(sessionId)!;
+      } else if (!sessionId && req.method === "POST") {
+        // New session — create transport
+        transport = new WebStandardStreamableHTTPServerTransport({
+          sessionIdGenerator: () => crypto.randomUUID(),
+          onsessioninitialized: (id) => {
+            sessions.set(id, transport);
+          },
+        });
+
+        transport.onclose = () => {
+          if (transport.sessionId) {
+            sessions.delete(transport.sessionId);
+          }
+        };
+
+        await server.connect(transport);
+      } else if (req.method === "DELETE" && sessionId) {
+        // Session not found for DELETE — already closed
+        return new Response(null, { status: 204 });
+      } else {
+        return new Response("Bad Request: missing or invalid session", { status: 400 });
+      }
+
+      return transport.handleRequest(req);
+    },
+  });
+
+  console.error(`Hooksmith MCP HTTP server listening on http://localhost:${httpServer.port}/mcp`);
+}
+
 export async function startMcpServer(): Promise<void> {
   const server = createMcpServer();
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
+  if (process.env.HOOKSMITH_MCP_TRANSPORT === "http") {
+    await startHttpMcpServer(server);
+  } else {
+    const transport = new StdioServerTransport();
+    await server.connect(transport);
+  }
 }
